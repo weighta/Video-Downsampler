@@ -15,7 +15,7 @@ limit, and makes sure the file plays. You don't click anything after the drop.
   <img src="docs/done.png" alt="dshrink after shrinking a 147-second 1080p60 clip to 18.3 MB">
 </p>
 
-- **One 63 KB `.exe`:** a native Win32 app in plain C with no runtime, no
+- **One 72 KB `.exe`:** a native Win32 app in plain C with no runtime, no
   installer and no Python. It opens instantly (about 0.1 s). On first use it
   can fetch ffmpeg for you in one click.
 - **Automatic quality ladder:** a short clip stays 1080p60. A longer one steps
