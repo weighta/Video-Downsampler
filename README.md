@@ -15,8 +15,9 @@ limit, and makes sure the file plays. You don't click anything after the drop.
   <img src="docs/done.png" alt="dshrink after shrinking a 147-second 1080p60 clip to 18.3 MB">
 </p>
 
-- **One 55 KB `.exe`:** a native Win32 app in plain C with no runtime, no
-  installer and no Python. It opens instantly (about 0.1 s).
+- **One 63 KB `.exe`:** a native Win32 app in plain C with no runtime, no
+  installer and no Python. It opens instantly (about 0.1 s). On first use it
+  can fetch ffmpeg for you in one click.
 - **Automatic quality ladder:** a short clip stays 1080p60. A longer one steps
   down to 720p, 540p, 30 fps... only as far as it has to.
 - **Hits the size every time:** 2-pass encoding, then a size check, and a
@@ -27,14 +28,38 @@ limit, and makes sure the file plays. You don't click anything after the drop.
 
 ## Download
 
-1. Download **[`dshrink.exe`](dshrink.exe)** from this repository (Windows 10/11,
-   64-bit).
-2. Get **ffmpeg** (with libx264). Either run `winget install Gyan.FFmpeg`, or
-   download a build and put `ffmpeg.exe` next to `dshrink.exe`.
+Download **[`dshrink.exe`](dshrink.exe)** from this repository (Windows 10/11,
+64-bit), put it in any folder, and run it. There's nothing to install.
 
-That's it; there's nothing to install. dshrink finds `ffmpeg.exe` next to
-itself, in a `bin\` folder beside it, on your PATH, or wherever the
-`DSHRINK_FFMPEG` environment variable points.
+### First run: one click to get ffmpeg
+
+dshrink does the encoding with [ffmpeg](https://ffmpeg.org/). If ffmpeg isn't
+on your PC yet, the window offers to fetch it:
+
+| ffmpeg missing | One click later |
+|---|---|
+| ![first run](docs/first-run.png) | ![downloading](docs/downloading.png) |
+
+Click **Download ffmpeg** and dshrink:
+
+1. downloads the official "release essentials" Windows build from
+   [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (about 115 MB, one time
+   only),
+2. checks it against the SHA-256 checksum gyan.dev publishes for that exact
+   package,
+3. unpacks just `ffmpeg.exe` and its license with Windows' built-in `tar`,
+   into a `bin\` folder next to `dshrink.exe` (or
+   `%LOCALAPPDATA%\dshrink\bin` if that folder isn't writable),
+4. checks the new ffmpeg runs and has the x264 encoder, then starts any videos
+   you already dropped.
+
+Nothing downloads until you click, and **Cancel** removes the partial
+download. The whole thing takes about a minute on a typical connection.
+
+Already have ffmpeg? dshrink uses it automatically if `ffmpeg.exe` is next to
+`dshrink.exe`, in `bin\` beside it, on your PATH (for example after
+`winget install Gyan.FFmpeg`), or wherever the `DSHRINK_FFMPEG` environment
+variable points.
 
 ## How to use it
 
@@ -133,7 +158,8 @@ build.bat
 
 `src\dshrink.c` is a single C file built with `/O1 /GS-`, no C runtime,
 linked only against Windows system libraries (kernel32, user32, gdi32,
-comctl32, shell32, comdlg32, advapi32, ole32). `src\` also holds the icon,
+comctl32, shell32, comdlg32, advapi32, ole32, wininet for the ffmpeg
+download, bcrypt for its SHA-256 check). `src\` also holds the icon,
 the manifest (visual styles, DPI-aware) and the resource script.
 
 Self-test switches used during development:
@@ -149,5 +175,7 @@ Self-test switches used during development:
 ## License
 
 MIT, see [LICENSE](LICENSE). ffmpeg and x264 are separate projects under
-their own (L)GPL licenses and are not included. This project is not
+their own (L)GPL licenses and are not part of this repository. The one-click
+download fetches gyan.dev's build and saves its license as
+`bin\ffmpeg-LICENSE.txt`. This project is not
 affiliated with Discord.

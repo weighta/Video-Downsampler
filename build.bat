@@ -16,5 +16,5 @@ rc /nologo /fo obj\dshrink.res src\dshrink.rc || exit /b 1
 link /nologo /NODEFAULTLIB /ENTRY:WinMainCRTStartup /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF ^
      /STACK:1048576,1048576 /MANIFEST:NO /EMITTOOLVERSIONINFO:NO /OUT:dshrink.exe ^
      obj\dshrink.obj obj\dshrink.res kernel32.lib user32.lib gdi32.lib comctl32.lib ^
-     shell32.lib comdlg32.lib advapi32.lib ole32.lib uuid.lib || exit /b 1
+     shell32.lib comdlg32.lib advapi32.lib ole32.lib uuid.lib wininet.lib bcrypt.lib || exit /b 1
 for %%f in (dshrink.exe) do echo dshrink.exe: %%~zf bytes

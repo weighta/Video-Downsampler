@@ -10,6 +10,8 @@
  *
  * Needs ffmpeg.exe (with libx264): next to dshrink.exe, in a bin\ folder
  * beside it, on PATH, or named by the DSHRINK_FFMPEG environment variable.
+ * If none is found, a "Download ffmpeg" button fetches gyan.dev's release
+ * essentials build (SHA-256 checked) into bin\ - only when clicked.
  *
  * Command line:
  *   dshrink.exe [video ...]          open the window (or hand the videos to
@@ -34,6 +36,8 @@
 #include <ole2.h>
 #include <shlobj.h>
 #include <intrin.h>
+#include <wininet.h>
+#include <bcrypt.h>
 
 /* ---------------------------------------------------------------- no CRT */
 
@@ -337,8 +341,8 @@ text:
     r->tail[r->tailn++] = '\n'; r->tail[r->tailn] = 0;
 }
 
-/* returns exit code; -1 = could not start; -2 = cancelled */
-static int run_ffmpeg(WCHAR *cmd, Run *r)
+/* runs app (hidden) with output to r; returns exit code, -1 = could not start, -2 = cancelled */
+static int run_proc(const WCHAR *app, WCHAR *cmd, Run *r)
 {
     SECURITY_ATTRIBUTES sa = { sizeof sa, 0, TRUE };
     STARTUPINFOW si; PROCESS_INFORMATION pi;
@@ -354,7 +358,7 @@ static int run_ffmpeg(WCHAR *cmd, Run *r)
     memset(&si, 0, sizeof si); si.cb = sizeof si;
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdInput = nul; si.hStdOutput = wr; si.hStdError = wr;
-    if (!CreateProcessW(g_ffmpeg, cmd, 0, 0, TRUE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
+    if (!CreateProcessW(app, cmd, 0, 0, TRUE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
                         0, 0, &si, &pi)) {
         CloseHandle(rd); CloseHandle(wr); CloseHandle(nul);
         return -1;
@@ -384,6 +388,8 @@ static int run_ffmpeg(WCHAR *cmd, Run *r)
     if (g_cancel) return -2;
     return (int)code;
 }
+
+#define run_ffmpeg(cmd, r) run_proc(g_ffmpeg, cmd, r)
 
 static void q_arg(WB *b, const WCHAR *s) { wb_c(b, '"'); wb_s(b, s); wb_c(b, '"'); }
 
@@ -480,15 +486,20 @@ static void output_name(const WCHAR *src, WCHAR *out, int cap, int n)
     wb_s(&b, L".mp4");
 }
 
-static void rm_tree_flat(const WCHAR *dir)
+static void rm_tree(const WCHAR *dir)           /* a temp folder of ours, recursively */
 {
     WCHAR pat[1100], f[1100]; WIN32_FIND_DATAW fd; HANDLE h; WB b;
     wb_init(&b, pat, 1100); wb_s(&b, dir); wb_s(&b, L"\\*");
     h = FindFirstFileW(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (!lstrcmpW(fd.cFileName, L".") || !lstrcmpW(fd.cFileName, L"..")) continue;
             wb_init(&b, f, 1100); wb_s(&b, dir); wb_c(&b, '\\'); wb_s(&b, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) rm_tree(f);
+                else RemoveDirectoryW(f);           /* never follow links out */
+                continue;
+            }
             SetFileAttributesW(f, FILE_ATTRIBUTE_NORMAL);
             DeleteFileW(f);
         } while (FindNextFileW(h, &fd));
@@ -669,9 +680,177 @@ static DWORD WINAPI worker(LPVOID unused)
         res->kind = K_DONE;
     }
 clean:
-    rm_tree_flat(tmpdir);
+    rm_tree(tmpdir);
 done:
     PostMessageW(g_wnd, WM_APP_DONE, 0, 0);
+    return 0;
+}
+
+/* ------------------------------------------- one-click ffmpeg download */
+
+/* gyan.dev's "release essentials" build: official Windows builds linked from
+   ffmpeg.org, includes libx264, publishes a SHA-256 next to each package. */
+#define FF_URL L"https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+#define WM_APP_FFDONE (WM_APP + 5)
+static int g_ff_ok, g_ff_cancelled;
+static WCHAR g_ff_msg[400], g_ff_path[MAX_PATH];
+
+/* 1 = ok, 0 = failed (g_ff_msg says why), -2 = cancelled */
+static int http_get(HINTERNET net, const WCHAR *url, HANDLE file, char *mem, int memcap,
+                    BCRYPT_HASH_HANDLE hh, WCHAR *final_url, int lo, int hi)
+{
+    static BYTE buf[65536];
+    HINTERNET u; DWORD status = 0, sl = sizeof status, got, wr, lb; WCHAR lenb[32], t[96];
+    long long total = 0, done = 0, shown = -1; int memn = 0, ok = 1, i; WB b;
+    u = InternetOpenUrlW(net, url, 0, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE |
+                         INTERNET_FLAG_NO_UI | INTERNET_FLAG_NO_COOKIES, 0);
+    if (!u) { wcpy(g_ff_msg, L"could not reach gyan.dev - check your internet connection", 400); return 0; }
+    HttpQueryInfoW(u, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &status, &sl, 0);
+    if (status != 200) {
+        wb_init(&b, g_ff_msg, 400); wb_s(&b, L"gyan.dev answered HTTP "); wb_u(&b, status);
+        InternetCloseHandle(u); return 0;
+    }
+    lb = sizeof lenb;
+    if (HttpQueryInfoW(u, HTTP_QUERY_CONTENT_LENGTH, lenb, &lb, 0))
+        for (i = 0; lenb[i] >= '0' && lenb[i] <= '9'; i++) total = total * 10 + (lenb[i] - '0');
+    if (final_url) {                         /* the versioned package after redirects */
+        DWORD fl = 2048 * sizeof(WCHAR);
+        if (!InternetQueryOptionW(u, INTERNET_OPTION_URL, final_url, &fl)) wcpy(final_url, url, 2048);
+    }
+    for (;;) {
+        if (g_cancel) { InternetCloseHandle(u); return -2; }
+        if (!InternetReadFile(u, buf, sizeof buf, &got)) { ok = 0; break; }
+        if (!got) break;
+        if (file && (!WriteFile(file, buf, got, &wr, 0) || wr != got)) {
+            wcpy(g_ff_msg, L"could not write the download (disk full?)", 400);
+            InternetCloseHandle(u); return 0;
+        }
+        if (mem) { DWORD k = got; if ((int)k > memcap - 1 - memn) k = memcap - 1 - memn; memcpy(mem + memn, buf, k); memn += k; }
+        if (hh) BCryptHashData(hh, buf, got, 0);
+        done += got;
+        if (total > 0) set_prog(lo + (int)((hi - lo) * ((double)done / total)));
+        if (file && done / 1000000 != shown) {
+            shown = done / 1000000;
+            wb_init(&b, t, 96); wb_s(&b, L"downloading ffmpeg  -  "); wb_u(&b, shown);
+            if (total > 0) { wb_s(&b, L" of "); wb_u(&b, (total + 500000) / 1000000); }
+            wb_s(&b, L" MB");
+            set_stage(t, 0);
+        }
+    }
+    InternetCloseHandle(u);
+    if (!ok || (total > 0 && done != total)) { wcpy(g_ff_msg, L"the download was interrupted - try again", 400); return 0; }
+    if (mem) mem[memn] = 0;
+    return 1;
+}
+
+static DWORD WINAPI ff_worker(LPVOID unused)
+{
+    static WCHAR exe[MAX_PATH], bindir[MAX_PATH], zip[MAX_PATH], tmp[MAX_PATH], tar[MAX_PATH],
+                 final_url[2048], shaurl[2100], cmd[4096], sub[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
+    static char sha[256], cap[65536];
+    HINTERNET net = 0; BCRYPT_ALG_HANDLE alg = 0; BCRYPT_HASH_HANDLE hh = 0; BYTE dig[32];
+    HANDLE f, fh; WIN32_FIND_DATAW fd; Run r; WB b; int rc, i, made_tmp = 0;
+    (void)unused;
+
+    g_ff_ok = 0; g_ff_cancelled = 0; g_ff_msg[0] = 0;
+    set_stage(L"connecting to gyan.dev", 1);
+
+    /* <dshrink folder>\bin, or %LOCALAPPDATA%\dshrink\bin if that isn't writable */
+    GetModuleFileNameW(0, exe, MAX_PATH);
+    path_dir(exe, bindir, MAX_PATH); lstrcatW(bindir, L"bin");
+    CreateDirectoryW(bindir, 0);
+    wb_init(&b, zip, MAX_PATH); wb_s(&b, bindir); wb_s(&b, L"\\ffmpeg-download.zip.part");
+    f = CreateFileW(zip, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, 0);
+    if (f == INVALID_HANDLE_VALUE) {
+        GetEnvironmentVariableW(L"LOCALAPPDATA", bindir, MAX_PATH - 20);
+        lstrcatW(bindir, L"\\dshrink"); CreateDirectoryW(bindir, 0);
+        lstrcatW(bindir, L"\\bin"); CreateDirectoryW(bindir, 0);
+        wb_init(&b, zip, MAX_PATH); wb_s(&b, bindir); wb_s(&b, L"\\ffmpeg-download.zip.part");
+        f = CreateFileW(zip, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, 0);
+        if (f == INVALID_HANDLE_VALUE) { wcpy(g_ff_msg, L"no folder to save ffmpeg in", 400); goto done; }
+    }
+
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, 0, 0) ||
+        BCryptCreateHash(alg, &hh, 0, 0, 0, 0, 0)) {
+        CloseHandle(f); wcpy(g_ff_msg, L"SHA-256 is unavailable", 400); goto clean;
+    }
+    net = InternetOpenW(L"dshrink/1.0", INTERNET_OPEN_TYPE_PRECONFIG, 0, 0, 0);
+    rc = net ? http_get(net, FF_URL, f, 0, 0, hh, final_url, 0, 850) : 0;
+    CloseHandle(f);
+    if (!net) wcpy(g_ff_msg, L"no internet access", 400);
+    if (rc == -2) { g_ff_cancelled = 1; goto clean; }
+    if (rc != 1) goto clean;
+
+    /* compare against the checksum gyan.dev publishes for that exact package */
+    set_stage(L"checking the download", 0);
+    BCryptFinishHash(hh, dig, 32, 0);
+    wb_init(&b, shaurl, 2100); wb_s(&b, final_url); wb_s(&b, L".sha256");
+    rc = http_get(net, shaurl, 0, sha, sizeof sha, 0, 0, 850, 860);
+    if (rc == -2) { g_ff_cancelled = 1; goto clean; }
+    if (rc != 1) goto clean;
+    for (i = 0; i < 32; i++) {
+        static const char hx[] = "0123456789abcdef";
+        char c1 = sha[2 * i], c2 = sha[2 * i + 1];
+        if (c1 >= 'A' && c1 <= 'F') c1 += 32;
+        if (c2 >= 'A' && c2 <= 'F') c2 += 32;
+        if (c1 != hx[dig[i] >> 4] || c2 != hx[dig[i] & 15]) {
+            wcpy(g_ff_msg, L"the download didn't match its SHA-256 checksum - try again", 400);
+            goto clean;
+        }
+    }
+
+    /* unpack just ffmpeg.exe and its license with Windows' own tar.exe */
+    set_stage(L"unpacking", 0); set_prog(870);
+    wb_init(&b, tmp, MAX_PATH); wb_s(&b, bindir); wb_s(&b, L"\\.ffmpeg-unpack");
+    rm_tree(tmp);
+    CreateDirectoryW(tmp, 0); made_tmp = 1;
+    GetSystemDirectoryW(tar, MAX_PATH - 10); lstrcatW(tar, L"\\tar.exe");
+    wb_init(&b, cmd, 4096); q_arg(&b, tar); wb_s(&b, L" -xf "); q_arg(&b, zip);
+    wb_s(&b, L" -C "); q_arg(&b, tmp); wb_s(&b, L" \"*/bin/ffmpeg.exe\" \"*/LICENSE\"");
+    memset(&r, 0, sizeof r);
+    rc = run_proc(tar, cmd, &r);
+    if (rc == -2) { g_ff_cancelled = 1; goto clean; }
+    if (rc == -1) { wcpy(g_ff_msg, L"Windows' tar.exe is missing - install ffmpeg yourself (winget install Gyan.FFmpeg)", 400); goto clean; }
+    if (rc) { wcpy(g_ff_msg, L"could not unpack: ", 400); tail_to(g_ff_msg + lstrlenW(g_ff_msg), 300, r.tail); goto clean; }
+    sub[0] = 0;
+    wb_init(&b, src, MAX_PATH); wb_s(&b, tmp); wb_s(&b, L"\\*");
+    fh = FindFirstFileW(src, &fd);
+    if (fh != INVALID_HANDLE_VALUE) {
+        do if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != '.') {
+            wb_init(&b, sub, MAX_PATH); wb_s(&b, tmp); wb_c(&b, '\\'); wb_s(&b, fd.cFileName); break;
+        } while (FindNextFileW(fh, &fd));
+        FindClose(fh);
+    }
+    wb_init(&b, src, MAX_PATH); wb_s(&b, sub); wb_s(&b, L"\\bin\\ffmpeg.exe");
+    wb_init(&b, dst, MAX_PATH); wb_s(&b, bindir); wb_s(&b, L"\\ffmpeg.exe");
+    if (!sub[0] || !MoveFileExW(src, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+        wcpy(g_ff_msg, L"ffmpeg.exe wasn't in the download as expected", 400); goto clean;
+    }
+    wb_init(&b, src, MAX_PATH); wb_s(&b, sub); wb_s(&b, L"\\LICENSE");
+    wb_init(&b, cmd, 4096); wb_s(&b, bindir); wb_s(&b, L"\\ffmpeg-LICENSE.txt");
+    MoveFileExW(src, cmd, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+
+    /* make sure it runs and has the encoder we need */
+    set_stage(L"testing ffmpeg", 0); set_prog(950);
+    memset(&r, 0, sizeof r); r.cap = cap; r.capmax = sizeof cap; cap[0] = 0;
+    wb_init(&b, cmd, 4096); q_arg(&b, dst); wb_s(&b, L" -hide_banner -encoders");
+    run_proc(dst, cmd, &r);
+    if (!sfind(cap, "libx264")) {
+        DeleteFileW(dst);
+        wcpy(g_ff_msg, L"the downloaded ffmpeg doesn't run or has no libx264", 400); goto clean;
+    }
+    wcpy(g_ff_path, dst, MAX_PATH);
+    set_prog(1000);
+    g_ff_ok = 1;
+clean:
+    DeleteFileW(zip);
+    if (made_tmp) rm_tree(tmp);
+    if (hh) BCryptDestroyHash(hh);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    if (net) InternetCloseHandle(net);
+done:
+    if (g_cancel) g_ff_cancelled = 1;
+    PostMessageW(g_wnd, WM_APP_FFDONE, 0, 0);
     return 0;
 }
 
@@ -745,12 +924,13 @@ static void save_settings(const WCHAR *limit, int fps30)
 #define COPYDATA_ID 0x44534852     /* 'DSHR' */
 #define IDM_MENU 0x100             /* system-menu items must be < 0xF000 and multiples of 16 */
 enum { ID_TITLE = 10, ID_PROG, ID_STAGE, ID_STATUS, ID_DETECT, ID_LIMIT_L, ID_LIMIT,
-       ID_MB_L, ID_FPS_L, ID_FPS, ID_CANCEL, ID_FOLDER };
+       ID_MB_L, ID_FPS_L, ID_FPS, ID_CANCEL, ID_FOLDER, ID_GETFF };
 enum { S_IDLE, S_BUSY, S_DONE };
 
 static HINSTANCE g_inst;
 static HWND h_title, h_prog, h_stage, h_status, h_detect, h_limit_l, h_limit, h_mb_l,
-            h_fps_l, h_fps, h_cancel, h_folder, h_tip;
+            h_fps_l, h_fps, h_cancel, h_folder, h_getff, h_tip;
+static int g_dl;               /* the ffmpeg download is running */
 static HFONT f_title, f_norm, f_bold, f_small;
 static HBRUSH br_state[3], br_hover;
 static COLORREF col_state[3] = { RGB(0xee, 0xf2, 0xf7), RGB(0xff, 0xf7, 0xe6), RGB(0xea, 0xf7, 0xee) };
@@ -787,6 +967,7 @@ static void update_title(void)
     WCHAR t[400]; WB b;
     wb_init(&b, t, 400);
     if (g_hover) wb_s(&b, L"Release to shrink");
+    else if (g_dl) wb_s(&b, L"Getting ffmpeg (one time only)");
     else if (g_state == S_BUSY) {
         wb_s(&b, g_cur_name);
         if (g_qn) { wb_s(&b, L"   (+"); wb_u(&b, g_qn); wb_s(&b, L" queued)"); }
@@ -798,7 +979,8 @@ static void set_state(int s)
 {
     g_state = s;
     ShowWindow(h_cancel, s == S_BUSY ? SW_SHOW : SW_HIDE);
-    ShowWindow(h_folder, s != S_BUSY && g_last_out[0] ? SW_SHOW : SW_HIDE);
+    ShowWindow(h_folder, s != S_BUSY && g_last_out[0] && g_ffmpeg[0] ? SW_SHOW : SW_HIDE);
+    ShowWindow(h_getff, s != S_BUSY && !g_ffmpeg[0] ? SW_SHOW : SW_HIDE);
     update_title();
     InvalidateRect(g_wnd, 0, TRUE);
 }
@@ -823,6 +1005,7 @@ static void layout(void)
     MoveWindow(h_fps, x0 + S(192), by, S(62), S(200), TRUE);
     MoveWindow(h_cancel, x1 - S(80), by - S(1), S(80), S(26), TRUE);
     MoveWindow(h_folder, x1 - S(96), by - S(1), S(96), S(26), TRUE);
+    MoveWindow(h_getff, x1 - S(128), by - S(1), S(128), S(26), TRUE);
 }
 
 static HWND mk(const WCHAR *cls, const WCHAR *txt, DWORD style, int id, HFONT f)
@@ -870,7 +1053,14 @@ static void start_next(void)
 {
     WCHAR limit[32]; int fps30; double mb;
     if (g_thread || !g_qn) { update_title(); return; }
-    if (!g_ffmpeg[0]) return;
+    if (!g_ffmpeg[0]) {
+        WCHAR t[200]; WB b; wb_init(&b, t, 200);
+        wb_u(&b, g_qn); wb_s(&b, g_qn == 1 ? L" video is" : L" videos are");
+        wb_s(&b, L" waiting. Click Download ffmpeg (free, about 115 MB, one time) and "
+                 L"encoding starts right after.");
+        set_status(t, 0);
+        return;
+    }
     read_settings_ui(limit, 32, &fps30);
     {   char a[32]; int i; for (i = 0; i < 31 && limit[i]; i++) a[i] = (char)limit[i]; a[i] = 0; mb = satof(a); }
     if (mb <= 0) { set_status(L"The limit must be a number of MB, e.g. 20.", 2); return; }
@@ -976,6 +1166,49 @@ static void finished(void)
     }
     log_result(r);
     start_next();
+    if (!g_thread && !g_qn && g_autoclose >= 0) SetTimer(g_wnd, 2, g_autoclose, 0);
+}
+
+static void start_ff_download(void)
+{
+    if (g_thread || g_ffmpeg[0]) return;
+    g_cancel = 0; g_dl = 1;
+    EnterCriticalSection(&g_cs);
+    g_sh.detect[0] = 0; g_sh.reason[0] = 0; g_sh.note[0] = 0; g_sh.stage[0] = 0; g_sh.prog = 0;
+    LeaveCriticalSection(&g_cs);
+    SendMessageW(h_prog, PBM_SETPOS, 0, 0);
+    set_status(L"", 0);
+    set_state(S_BUSY);
+    g_thread = CreateThread(0, 1 << 20, ff_worker, 0, 0, 0);
+}
+
+static void ff_finished(void)
+{
+    WaitForSingleObject(g_thread, INFINITE);
+    CloseHandle(g_thread); g_thread = 0;
+    g_dl = 0;
+    if (g_ff_ok) {
+        WCHAR t[MAX_PATH + 80]; WB b;
+        wcpy(g_ffmpeg, g_ff_path, MAX_PATH);
+        SendMessageW(h_prog, PBM_SETPOS, 1000, 0);
+        set_text(h_stage, L"ffmpeg is ready");
+        wb_init(&b, t, MAX_PATH + 80); wb_s(&b, L"\x2714 ffmpeg installed: "); wb_s(&b, g_ffmpeg);
+        set_status(t, 1);
+        set_state(S_DONE);
+    } else if (g_ff_cancelled) {
+        SendMessageW(h_prog, PBM_SETPOS, 0, 0);
+        set_text(h_stage, L"Download cancelled - nothing was kept");
+        set_status(L"", 0);
+        set_state(S_IDLE);
+    } else {
+        WCHAR t[500]; WB b;
+        SendMessageW(h_prog, PBM_SETPOS, 0, 0);
+        set_text(h_stage, L"Download failed");
+        wb_init(&b, t, 500); wb_s(&b, L"ffmpeg download failed: "); wb_s(&b, g_ff_msg);
+        set_status(t, 2);
+        set_state(S_IDLE);
+    }
+    start_next();                          /* anything dropped meanwhile */
     if (!g_thread && !g_qn && g_autoclose >= 0) SetTimer(g_wnd, 2, g_autoclose, 0);
 }
 
@@ -1124,6 +1357,8 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         h_fps = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, ID_FPS, f_norm);
         h_cancel = mk(L"BUTTON", L"Cancel", BS_PUSHBUTTON | WS_TABSTOP, ID_CANCEL, f_norm);
         h_folder = mk(L"BUTTON", L"Open folder", BS_PUSHBUTTON | WS_TABSTOP, ID_FOLDER, f_norm);
+        h_getff = mk(L"BUTTON", L"Download ffmpeg", BS_PUSHBUTTON | WS_TABSTOP, ID_GETFF, f_norm);
+        ShowWindow(h_getff, SW_HIDE);
         SendMessageW(h_limit, CB_ADDSTRING, 0, (LPARAM)L"10");
         SendMessageW(h_limit, CB_ADDSTRING, 0, (LPARAM)L"20");
         SendMessageW(h_limit, CB_ADDSTRING, 0, (LPARAM)L"50");
@@ -1194,6 +1429,9 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
             LeaveCriticalSection(&g_cs);
             set_text(h_stage, L"Cancelling...");
             return 0;
+        case ID_GETFF:
+            start_ff_download();
+            return 0;
         case ID_FOLDER:
             if (g_last_out[0]) {
                 PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(g_last_out);
@@ -1227,6 +1465,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
     }
     case WM_APP_REFRESH: refresh(); return 0;
     case WM_APP_DONE: finished(); return 0;
+    case WM_APP_FFDONE: ff_finished(); return 0;
     case WM_APP_START:
         SendMessageW(GetWindow(h_limit, GW_CHILD), EM_SETSEL, (WPARAM)-1, 0);
         start_next();
@@ -1351,8 +1590,11 @@ void WinMainCRTStartup(void)
     ShowWindow(w, SW_SHOW);
     SetFocus(w);                     /* not the Limit box: no stray selection */
     UpdateWindow(w);
-    if (!g_ffmpeg[0])
-        set_status(L"ffmpeg.exe not found. Put it next to dshrink.exe (or in bin\\), or install it: winget install Gyan.FFmpeg", 2);
+    if (!g_ffmpeg[0]) {
+        set_status(L"dshrink needs ffmpeg to encode. Click Download ffmpeg to get the free official "
+                   L"build (about 115 MB, once, from gyan.dev).", 0);
+        set_state(S_IDLE);
+    }
     for (i = 0; i < nfiles; i++) enqueue(files[i]);
     PostMessageW(w, WM_APP_START, 0, 0);
     if (g_selftest_n) PostMessageW(w, WM_APP_SELFTEST, 0, 0);
