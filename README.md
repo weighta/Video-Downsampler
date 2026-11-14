@@ -28,8 +28,10 @@ limit, and makes sure the file plays. You don't click anything after the drop.
 
 ## Download
 
-Download **[`dshrink.exe`](dshrink.exe)** from this repository (Windows 10/11,
-64-bit), put it in any folder, and run it. There's nothing to install.
+**[⬇ Download dshrink.exe](https://github.com/weighta/Video-Downsampler/releases/latest/download/dshrink.exe)**
+(latest release, Windows 10/11 64-bit), put it in any folder, and run it.
+There's nothing to install. All versions are on the
+[Releases](https://github.com/weighta/Video-Downsampler/releases) page.
 
 ### First run: one click to get ffmpeg
 
